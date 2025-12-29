@@ -6,7 +6,7 @@ __pycache__/
 # Virtual Environment
 venv/
 env/
-.env
+
 
 # IDE
 .vscode/
@@ -25,6 +25,7 @@ Thumbs.db
 # Sensitive files
 .env
 *.env
+
 
 # Compiled files
 *.pyc

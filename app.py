@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, jsonify
-import google.generativeai as genai
+from openai import OpenAI
 from dotenv import load_dotenv
 import os
 import random
@@ -15,62 +15,36 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
-load_dotenv()
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+loaded = load_dotenv(env_path)
+print(f"DEBUG: Loading .env from {env_path}")
+print(f"DEBUG: .env loaded: {loaded}")
+print(f"DEBUG: API Key present: {bool(os.getenv('OPENROUTER_API_KEY'))}")
+if os.getenv('OPENROUTER_API_KEY'):
+    print(f"DEBUG: API Key starts with: {os.getenv('OPENROUTER_API_KEY')[:10]}...")
 
-# Configure Gemini AI with enhanced error handling
+
+# Configure OpenRouter (OpenAI Compatible)
 try:
-    api_key = os.getenv('GEMINI_API_KEY')
+    api_key = os.getenv('OPENROUTER_API_KEY')
     if not api_key:
         logger.error("No API key found in environment variables")
-        raise ValueError("Gemini API key is missing")
+        # We don't raise here to allow the app to start, but it will fail on generation
     
-    genai.configure(api_key=api_key)
-    logger.info("Gemini AI successfully configured")
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    logger.info("OpenRouter client successfully configured")
 except Exception as e:
-    logger.error(f"Gemini API Configuration Error: {e}", exc_info=True)
-    # You might want to add a fallback mechanism or exit the application
-    raise
+    logger.error(f"OpenRouter Configuration Error: {e}", exc_info=True)
+    client = None
 
 app = Flask(__name__)
 
-# Self-Pinging Function with Enhanced Reliability
-def keep_alive():
-    while True:
-        try:
-            # Use multiple backup URLs for redundancy
-            urls = [
-                'https://hecker-ai.onrender.com',
-                'https://academic-ai-2-0.onrender.com',
-                'https://academic-ai-backup.onrender.com'
-            ]
-            
-            # Ping multiple URLs for increased reliability
-            for url in urls:
-                try:
-                    response = requests.get(url, timeout=10)
-                    print(f"Self-ping status for {url}: {response.status_code}")
-                except requests.RequestException as e:
-                    print(f"Self-ping error for {url}: {e}")
-                
-                # Add a small delay between pings to prevent overwhelming the server
-                time.sleep(2)
-            
-            # Reduce sleep time to ping more frequently
-            time.sleep(300)  # 5 minutes instead of 20 minutes
-        
-        except Exception as e:
-            print(f"Critical self-ping error: {e}")
-            
-            # If something goes wrong, wait a bit and retry
-            time.sleep(60)  # Wait 1 minute before retrying
-
-# Start the keep-alive thread with error handling
-try:
-    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
-    keep_alive_thread.start()
-    print("Self-ping thread started successfully")
-except Exception as e:
-    print(f"Failed to start self-ping thread: {e}")
+# Global storage for sessions (in-memory)
+# Format: {session_id: [{"role": "user", "content": "..."}, ...]}
+sessions = {}
 
 # AI Configuration
 AI_DESCRIPTION = """
@@ -88,209 +62,84 @@ Key Characteristics:
 - Focused on student's individual learning journey
 """
 
-# Model Configuration
-generation_config = {
-    'temperature': 0.7,
-    'top_p': 0.9,
-    'max_output_tokens': 2048
-}
-
-safety_settings = [
-    {'category': 'HARM_CATEGORY_HARASSMENT', 'threshold': 'BLOCK_NONE'},
-    {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'BLOCK_NONE'},
-    {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'threshold': 'BLOCK_NONE'},
-    {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_NONE'}
+# Model Configuration - Prioritizing high capability free models
+MODELS = [
+    "google/gemma-2-9b-it:free",                 # User preferred model
+    "google/gemini-2.0-flash-thinking-exp:free", # High reasoning capability
+    "meta-llama/llama-3.1-70b-instruct:free",    # Excellent general knowledge
+    "meta-llama/llama-3.1-8b-instruct:free",     # Fast and reliable fallback
+    "microsoft/phi-3-mini-128k-instruct:free",   # Very reliable & fast fallback
+    "mistralai/mistral-7b-instruct:free",        # Solid fallback
 ]
 
-model = genai.GenerativeModel(
-    model_name='gemini-pro', 
-    generation_config=generation_config, 
-    safety_settings=safety_settings
-)
+def generate_with_fallback(messages, temperature=0.7):
+    """Try to generate a response using models in priority order"""
+    last_error = None
+    
+    logger.debug(f"Generating with messages: {messages}")
 
-chat = model.start_chat(history=[
-    {
-        'role': 'user',
-        'parts': [AI_DESCRIPTION]
-    },
-    {
-        'role': 'model',
-        'parts': ['I understand. I will act as Hecker, an advanced AI learning companion with the described characteristics.']
-    }
-])
+    for model in MODELS:
+        try:
+            logger.info(f"Attempting generation with model: {model}")
+            if not client:
+                raise ValueError("OpenRouter client not initialized")
 
-# Context Management
-class ConversationContext:
-    def __init__(self, max_history=5):
-        self.history = []
-        self.max_history = max_history
-        self.current_topic = None
-        self.difficulty_level = 'intermediate'
-
-    def add_interaction(self, user_query, ai_response):
-        # Trim history if it exceeds max_history
-        if len(self.history) >= self.max_history:
-            self.history.pop(0)
-        
-        # Add new interaction
-        self.history.append({
-            'user_query': user_query,
-            'ai_response': ai_response
-        })
-
-    def detect_topic(self, query):
-        # Simple topic detection using keyword matching
-        topics = {
-            'mathematics': ['math', 'algebra', 'geometry', 'calculus', 'trigonometry'],
-            'science': ['physics', 'chemistry', 'biology', 'science'],
-            'language': ['english', 'grammar', 'writing', 'literature'],
-            'history': ['history', 'historical', 'civilization', 'era'],
-            'technology': ['computer', 'programming', 'tech', 'coding']
-        }
-
-        for topic, keywords in topics.items():
-            if any(keyword in query.lower() for keyword in keywords):
-                self.current_topic = topic
-                return topic
-        
-        return None
-
-    def adjust_difficulty(self, query):
-        # Detect complexity of query and adjust difficulty
-        complexity_indicators = {
-            'advanced': ['prove', 'derive', 'complex', 'advanced', 'theoretical'],
-            'beginner': ['explain', 'what is', 'basic', 'simple', 'introduction']
-        }
-
-        for level, indicators in complexity_indicators.items():
-            if any(indicator in query.lower() for indicator in indicators):
-                self.difficulty_level = level
-                break
-
-conversation_context = ConversationContext()
-
-def generate_emoji():
-    """Generate a random emoji to add personality"""
-    emojis = [
-        '😊', '🌟', '👍', '🚀', '🤔', '💡', '📚', '🎓', 
-        '🧠', '✨', '🌈', '👏', '🤓', '💪', '🌞'
-    ]
-    return random.choice(emojis)
-
-def format_solution(text):
-    """Format mathematical solutions with clear steps and equations"""
-    # Split into steps
-    steps = text.split('\n\n')
-    formatted_steps = []
-    
-    for i, step in enumerate(steps):
-        if i == 0 and step.lower().startswith('solution:'):
-            formatted_steps.append(f"**{step.strip()}**\n")
-        elif step.strip():
-            # Format step numbers
-            if step.lower().startswith(('step ', 'therefore', 'hence', 'thus', 'final')):
-                formatted_steps.append(f"\n**{step.strip()}**\n")
-            else:
-                # Format equations and explanations
-                lines = step.split('\n')
-                formatted_lines = []
-                for line in lines:
-                    # Check if line contains equations
-                    if any(char in line for char in '=+-×÷*/'):
-                        formatted_lines.append(f"```math\n{line.strip()}\n```")
-                    else:
-                        formatted_lines.append(line.strip())
-                formatted_steps.append('\n'.join(formatted_lines))
-    
-    return '\n\n'.join(formatted_steps)
-
-def sanitize_response(text):
-    """Clean and format the AI response"""
-    # Enhanced formatting to prevent multiple boxes
-    
-    # Normalize line breaks and spacing
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    # Improve step and section formatting
-    text = re.sub(r'^(Step\s*\d+:)', r'**\1**', text, flags=re.MULTILINE)
-    text = re.sub(r'^(Conclusion:)', r'**\1**', text, flags=re.MULTILINE)
-    
-    # Format equations and mathematical expressions
-    text = re.sub(r'\$\$(.*?)\$\$', r'**Equation:** \1', text, flags=re.DOTALL)
-    text = re.sub(r'\$(.*?)\$', r'*\1*', text)
-    
-    # Preserve overall response structure
-    text = text.strip()
-    
-    # Sanitize HTML to prevent XSS
-    formatted_text = (
-        text.replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;')
-            .replace('"', '&quot;')
-            .replace("'", '&#039;')
-    )
-    
-    return formatted_text
-
-def format_mathematical_notation(text):
-    """
-    Standardize mathematical notation across all AI responses.
-    """
-    # Replace basic mathematical operators
-    text = re.sub(r'\*\*', '^', text)
-    text = re.sub(r'\*', '×', text)
-    
-    # Format equations with proper spacing and alignment
-    equations = re.finditer(r'\$\$(.*?)\$\$', text, re.DOTALL)
-    for eq in equations:
-        formatted_eq = f'<div class="equation">{eq.group(1).strip()}</div>'
-        text = text.replace(eq.group(0), formatted_eq)
-    
-    # Format inline math expressions
-    inline_math = re.finditer(r'\$(.*?)\$', text)
-    for math in inline_math:
-        formatted_math = f'<span class="math-expression">{math.group(1).strip()}</span>'
-        text = text.replace(math.group(0), formatted_math)
-    
-    # Format step-by-step solutions
-    steps = text.split('\n\n')
-    formatted_steps = []
-    for step in steps:
-        if step.strip():
-            formatted_steps.append(f'<div class="solution-step">{step.strip()}</div>')
-    
-    text = '\n'.join(formatted_steps)
-    
-    # Format variables and symbols
-    symbols = re.finditer(r'([a-zA-Z]_[0-9a-zA-Z]|[a-zA-Z])', text)
-    for symbol in symbols:
-        if symbol.group(0) in ['a', 'an', 'the', 'in', 'on', 'at', 'to', 'for']:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                top_p=0.9,
+                max_tokens=2048,
+                extra_headers={
+                    "HTTP-Referer": "http://localhost:5000", # Optional, for including your app on openrouter.ai rankings.
+                    "X-Title": "AcademicAi", # Optional. Shows in rankings on openrouter.ai.
+                }
+            )
+            
+            content = completion.choices[0].message.content
+            if not content:
+                logger.warning(f"Model {model} returned empty content")
+                continue
+                
+            logger.debug(f"Generation success with {model}: {content[:50]}...")
+            return content
+            
+        except Exception as e:
+            logger.warning(f"Model {model} failed: {str(e)}")
+            last_error = e
             continue
-        formatted_symbol = f'<span class="symbol">{symbol.group(0)}</span>'
-        text = text.replace(symbol.group(0), formatted_symbol, 1)
-    
-    return text
-
-@app.route('/')
-def home():
-    now = datetime.now().strftime("%I:%M %p")
-    initial_question = "Welcome to Hecker! What would you like to learn today?"
-    return render_template('index.html', now=now, initial_question=initial_question)
+            
+    raise last_error
 
 @app.route('/generate_response', methods=['POST'])
 def generate_response():
-    user_message = request.json.get('message', '')
+    data = request.json
+    user_message = data.get('message', '')
+    session_id = data.get('session_id', 'default')
+    
+    # Initialize session if not exists
+    if session_id not in sessions:
+        sessions[session_id] = [
+            {"role": "system", "content": AI_DESCRIPTION}
+        ]
+    
+    # Add user message to history
+    sessions[session_id].append({"role": "user", "content": user_message})
     
     try:
-        response = chat.send_message(user_message)
+        response_text = generate_with_fallback(sessions[session_id])
+        
+        # Add AI response to history
+        sessions[session_id].append({"role": "assistant", "content": response_text})
+        
         return jsonify({
-            'response': response.text,
+            'response': response_text,
             'timestamp': datetime.now().strftime("%I:%M %p")
         })
     except Exception as e:
+        logger.error(f"Generation Error: {e}")
         return jsonify({
-            'response': f"I'm experiencing some difficulties. Error: {str(e)}",
+            'response': f"I'm experiencing difficulties with all available models. Please try again later. Error: {str(e)}",
             'timestamp': datetime.now().strftime("%I:%M %p")
         })
 
@@ -299,7 +148,7 @@ def query():
     try:
         data = request.json
         query_text = data.get('query', '')
-        is_regeneration = data.get('regenerate', False)
+        # is_regeneration = data.get('regenerate', False) # Unused currently
 
         # Generate response
         response_text = generate_response_with_context(query_text)
@@ -369,13 +218,38 @@ Query: {query}
 """
 
     try:
-        response = model.generate_content(context_prompt)
+        response = generate_with_fallback([
+            {"role": "system", "content": AI_DESCRIPTION},
+            {"role": "user", "content": context_prompt}
+        ])
+        
         # Apply mathematical notation formatting to the response
-        formatted_response = format_mathematical_notation(response.text)
+        formatted_response = format_mathematical_notation(response)
         return sanitize_response(formatted_response)
     except Exception as e:
         app.logger.error(f"Response generation error: {e}")
         return f"I'm sorry, I encountered an error processing your query. {generate_emoji()}"
+
+@app.route('/feedback', methods=['POST'])
+def feedback():
+    try:
+        data = request.json
+        score = data.get('score')
+        feedback_text = data.get('feedback')
+        logger.info(f"Feedback received - Score: {score}, Text: {feedback_text}")
+        return jsonify({'success': True})
+    except Exception as e:
+        logger.error(f"Feedback error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.errorhandler(404)
+def page_not_found(e):
+    logger.warning(f"404 Error: {request.url}")
+    return render_template('index.html', now=datetime.now().strftime("%I:%M %p"), initial_question="Page not found, but I'm here to help!"), 404
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({'status': 'alive'}), 200
 
 if __name__ == '__main__':
     app.run(debug=True)
